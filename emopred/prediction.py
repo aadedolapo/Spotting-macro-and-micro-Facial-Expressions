@@ -1,11 +1,9 @@
 import cv2
+import csv
 import torch
 import torch.nn.functional as F
-import uuid
-import os
-
-
-print(os.getcwd())
+import numpy as np
+from pathlib import Path
 
 model = torch.hub.load('pytorch/vision:v0.10.0',
                        'inception_v3', pretrained=True)
@@ -18,73 +16,109 @@ model = model.to(device)
 model.eval()
 
 
-def predict_emotion(input_video):
-    cap = cv2.VideoCapture(input_video)
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    # Default to 20 if FPS is not available
-    frame_rate = int(cap.get(cv2.CAP_PROP_FPS)) or 20
+def create_prediction_video(frames, storage, timestamp, model_type, fps=4, is_color=True):
+    """Creates a video from a list of frames and saves it."""
+    video_path = storage / f"pred_{model_type}_{timestamp}.mp4"
+    height, width = frames[0].shape[:2]
 
-    # Define the codec and create VideoWriter object
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # Ensure frames are in uint8 format
+    frames_uint8 = [(frame * 255).astype(np.uint8) if frame.max()
+                    <= 1 else frame.astype(np.uint8) for frame in frames]
 
-    output_video_name = f"output_{uuid.uuid4()}.mp4"
-    out = cv2.VideoWriter(output_video_name, fourcc,
-                          frame_rate, (frame_width, frame_height))
+    # Initialize VideoWriter
+    out = cv2.VideoWriter(str(video_path),
+                          cv2.VideoWriter_fourcc(*'avc1'),
+                          fps, (width, height),
+                          is_color)
+
+    if not out.isOpened():
+        out = cv2.VideoWriter(str(video_path),
+                              cv2.VideoWriter_fourcc(*'MJPG'),
+                              fps, (width, height),
+                              is_color)
+
+    for frame in frames_uint8:
+        out.write(frame)
+
+    out.release()
+    print(f"Saved video at: {video_path}")
+    return str(video_path)
+
+
+def predict_emotion(video_path, output_folder):
+    """Processes a video, detects emotions, and saves results + processed video."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise IOError("Cannot open video")
+
+    facedet = cv2.CascadeClassifier(
+        r'C:\Users\kings\OneDrive - MMU\MSC DATA SCIENCE\MSC Project\Msc-Project\haarcascades\haarcascade_frontalface_default.xml')
+
+    processed_frames = []
 
     while True:
-        # Capture a frame
         ret, frame = cap.read()
         if not ret:
-            break  # Exit the loop if no frame is captured
+            break  # Stop if video ends
 
-        facedet = cv2.CascadeClassifier(
-            'haarcascades\haarcascade_frontalface_default.xml')
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = facedet.detectMultiScale(gray_frame, 1.1, 4)
 
         if len(faces) == 0:
-            continue  # Skip processing this frame if no faces are detected
+            print("No faces detected in the frame")
+            continue
 
         for x, y, w, h in faces:
             roi_gray = gray_frame[y:y+h, x:x+w]
             roi_color = frame[y:y+h, x:x+w]
             cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
-            facess = facedet.detectMultiScale(roi_gray)
-            if len(facess) == 0:
-                continue
-            else:
-                for (ex, ey, ew, eh) in facess:
-                    # cropping the face
-                    face_roi = roi_color[ey:ey+eh, ex:ex+ew]
 
         rgb_image = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2RGB)
         image = cv2.resize(rgb_image, (299, 299))
-        image = image / 255.0  # normalization
-        data = torch.from_numpy(image)
-        data = data.type(torch.FloatTensor)
-        data = data.to(device)
-        # Reshape the tensor to have 3 as the first dimension
-        reshaped_data = data.permute(2, 0, 1)
-        reshaped_data = reshaped_data.unsqueeze(0)
+        image = image / 255.0  # nomalization
+        data = torch.from_numpy(image).type(torch.FloatTensor).to(device)
+        # Reshape the tensor to have 3 as the first dimension and adjust dimensions for model
+        reshaped_data = data.permute(2, 0, 1).unsqueeze(0)
+
         outputs = model(reshaped_data)
         pred = F.softmax(outputs[0], dim=-1)
         final_pred = torch.argmax(pred, 0)
 
-        if final_pred == 0:
-            emotion = "Negative"
-        elif final_pred == 1:
-            emotion = "Neutral"
-        else:
-            emotion = "Positive"
-
+        emotion = ["Negative", "Neutral", "Positive"][final_pred.item()]
         text_x, text_y = x, y - 10
         cv2.putText(frame, emotion, (text_x, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36, 255, 12), 2)
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
-        out.write(frame)
-    out.release()
+
+        # Confidence and emotion label
+        conf, classes = torch.max(pred, -1)
+        result_data = [[conf.item(), pred.tolist(), emotion]]
+
+        # Save results to CSV
+        csv_path = Path(output_folder) / \
+            (Path(video_path).stem + '_results.csv')
+        with open(csv_path, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            if file.tell() == 0:
+                writer.writerow(['Confidence', 'max_confidence', 'Emotion'])
+            writer.writerows(result_data)
+
+        cv2.imshow("Facial Expression Recognition", frame)
+        processed_frames.append(frame)
+
+        if cv2.waitKey(2) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    # Save processed frames as a video
+    timestamp = Path(video_path).stem
+    storage_path = Path(output_folder)
+    saved_video_path = create_prediction_video(
+        processed_frames, storage_path, timestamp, "emotion_detection", fps=4, is_color=True)
+
+    print(f"Video saved at: {saved_video_path}")
 
 
 if __name__ == '__main__':
-    predict_emotion(0)
+    predict_emotion()
